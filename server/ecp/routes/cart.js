@@ -1,0 +1,307 @@
+const router = require('express').Router();
+const crypto = require('crypto');
+const { query } = require('../../shared/db');
+const { getReservedQuantity } = require('../../shared/inventoryReservation');
+
+const ONLINE_BRANCH_ID = parseInt(process.env.ONLINE_BRANCH_ID || '1', 10);
+
+/**
+ * Helper to retrieve or create shopping cart for session / customer
+ */
+async function getOrCreateCart(req) {
+  const customerId = req.user?.id || null;
+  const guestToken = req.headers['x-guest-cart-token'] || req.cookies?.guest_cart_token || null;
+
+  let cart = null;
+
+  if (customerId) {
+    [cart] = await query(
+      `SELECT * FROM ecp_shopping_carts WHERE customer_id = $1 ORDER BY id DESC LIMIT 1`,
+      [customerId]
+    );
+  } else if (guestToken) {
+    [cart] = await query(
+      `SELECT * FROM ecp_shopping_carts WHERE session_id = $1 ORDER BY id DESC LIMIT 1`,
+      [guestToken]
+    );
+  }
+
+  if (!cart) {
+    const sessionToken = guestToken || crypto.randomUUID();
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
+    const [created] = await query(
+      `INSERT INTO ecp_shopping_carts (
+        customer_id, session_id, expires_at, created_at, updated_at
+      ) VALUES ($1, $2, $3, NOW(), NOW())
+      RETURNING *`,
+      [customerId, sessionToken, expiresAt]
+    );
+    cart = created;
+  }
+
+  return cart;
+}
+
+/**
+ * Helper to build unified cart payload with formatted items, counts, and subtotal
+ */
+async function getCartPayload(cartId, sessionId, couponCode = null) {
+  const items = await query(
+    `SELECT ci.id AS item_id,
+            ci.cart_id,
+            ci.product_id,
+            ci.variant_id,
+            ci.quantity,
+            ci.unit_price,
+            p.product_name,
+            p.product_code,
+            p.slug,
+            COALESCE(pv.image_url, p.featured_image) AS featured_image,
+            pv.variant_sku,
+            pv.color,
+            pv.size,
+            COALESCE(ib_var.available_qty, ib_base.available_qty, 0) AS stock_qty
+     FROM ecp_cart_items ci
+     JOIN products p ON p.id = ci.product_id
+     LEFT JOIN product_variants pv ON pv.id = ci.variant_id
+     LEFT JOIN inventory_balances ib_var ON ib_var.product_id = ci.product_id
+                                        AND ib_var.variant_id = ci.variant_id
+                                        AND ib_var.branch_id = $2
+     LEFT JOIN inventory_balances ib_base ON ib_base.product_id = ci.product_id
+                                         AND ib_base.variant_id IS NULL
+                                         AND ib_base.branch_id = $2
+     WHERE ci.cart_id = $1
+     ORDER BY ci.id ASC`,
+    [cartId, ONLINE_BRANCH_ID]
+  );
+
+  let subtotal = 0;
+  const formattedItems = (items || []).map((it) => {
+    const price = parseFloat(it.unit_price) || 0;
+    const qty = parseInt(it.quantity, 10);
+    const lineTotal = price * qty;
+    subtotal += lineTotal;
+
+    return {
+      ...it,
+      unit_price: price,
+      line_total: lineTotal,
+      display_name: it.color || it.size
+        ? `${it.product_name} (${[it.color, it.size].filter(Boolean).join(' / ')})`
+        : it.product_name,
+      is_in_stock: parseInt(it.stock_qty, 10) >= qty
+    };
+  });
+
+  return {
+    cart_id: cartId,
+    session_id: sessionId,
+    items: formattedItems,
+    items_count: formattedItems.reduce((acc, it) => acc + it.quantity, 0),
+    subtotal,
+    coupon_code: couponCode || null
+  };
+}
+
+/**
+ * GET /api/ecp/cart
+ * Get current shopping cart items with pricing and inventory status
+ */
+router.get('/', async (req, res) => {
+  try {
+    const cart = await getOrCreateCart(req);
+    const data = await getCartPayload(cart.id, cart.session_id, cart.coupon_code);
+    return res.json({ success: true, data });
+  } catch (err) {
+    console.error('ECP get cart error:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * POST /api/ecp/cart/items
+ * Add an item or increment quantity in the cart with lightning-fast execution
+ */
+router.post('/items', async (req, res) => {
+  try {
+    let { product_id, variant_id = null, quantity = 1 } = req.body;
+    const addQty = Math.max(1, parseInt(quantity, 10) || 1);
+
+    // If variant_id is not specified, check if product has variants and pick first available variant with stock
+    if (!variant_id) {
+      const stockVariants = await query(
+        `SELECT pv.id, COALESCE(ib.available_qty, 0) as stock
+         FROM product_variants pv
+         LEFT JOIN inventory_balances ib ON ib.variant_id = pv.id AND ib.branch_id = $2
+         WHERE pv.product_id = $1
+         ORDER BY (COALESCE(ib.available_qty, 0) > 0) DESC, pv.id ASC
+         LIMIT 1`,
+        [product_id, ONLINE_BRANCH_ID]
+      );
+      if (stockVariants && stockVariants.length > 0) {
+        variant_id = stockVariants[0].id;
+      }
+    }
+
+    // Run cart retrieval and product+stock validation in parallel
+    const [cart, prodRows] = await Promise.all([
+      getOrCreateCart(req),
+      query(
+        `SELECT p.id, p.product_name, p.selling_price, p.sale_price, p.status,
+                COALESCE(pv.price_modifier, 0) AS price_modifier,
+                COALESCE(ib_var.available_qty, ib_base.available_qty, 0) AS available_stock
+         FROM products p
+         LEFT JOIN product_variants pv ON pv.id = $2 AND pv.product_id = p.id
+         LEFT JOIN inventory_balances ib_var ON ib_var.product_id = p.id 
+                                            AND ib_var.branch_id = $3 
+                                            AND ib_var.variant_id = $2
+         LEFT JOIN inventory_balances ib_base ON ib_base.product_id = p.id 
+                                             AND ib_base.branch_id = $3 
+                                             AND ib_base.variant_id IS NULL
+         WHERE p.id = $1 AND p.status = 'active'`,
+        [product_id, variant_id, ONLINE_BRANCH_ID]
+      )
+    ]);
+
+    const prod = prodRows?.[0];
+    if (!prod) {
+      return res.status(404).json({ success: false, message: 'الصنف المطلوب غير متوفر حالياً' });
+    }
+
+    const availableStock = parseInt(prod.available_stock, 10) || 0;
+    const basePrice = parseFloat(prod.sale_price || prod.selling_price) || 0;
+    const unitPrice = basePrice + (parseFloat(prod.price_modifier) || 0);
+
+    // Check existing item in cart
+    const [existing] = await query(
+      `SELECT id, quantity FROM ecp_cart_items
+       WHERE cart_id = $1 AND product_id = $2 AND (variant_id = $3 OR ($3 IS NULL AND variant_id IS NULL))`,
+      [cart.id, product_id, variant_id]
+    );
+
+    const currentQtyInCart = existing ? parseInt(existing.quantity, 10) : 0;
+    const targetQty = currentQtyInCart + addQty;
+
+    if (availableStock < targetQty) {
+      return res.status(400).json({
+        success: false,
+        message: `عذراً، الرصيد المتاح من هذا الصنف هو ${availableStock} قطعة فقط.`
+      });
+    }
+
+    if (existing) {
+      await query(
+        `UPDATE ecp_cart_items
+         SET quantity = $1, unit_price = $2, updated_at = NOW()
+         WHERE id = $3`,
+        [targetQty, unitPrice, existing.id]
+      );
+    } else {
+      await query(
+        `INSERT INTO ecp_cart_items (
+          cart_id, product_id, variant_id, quantity, unit_price, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, NOW(), NOW())`,
+        [cart.id, product_id, variant_id, addQty, unitPrice]
+      );
+    }
+
+    // Return the fresh, complete cart payload immediately so frontend never needs another round-trip
+    const data = await getCartPayload(cart.id, cart.session_id, cart.coupon_code);
+
+    return res.json({
+      success: true,
+      message: 'تمت إضافة المنتج إلى سلة التسوق بنجاح',
+      cart_token: cart.session_id,
+      data
+    });
+  } catch (err) {
+    console.error('ECP add cart item error:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * PUT /api/ecp/cart/items/:id
+ * Update quantity of a specific item in cart
+ */
+router.put('/items/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { quantity } = req.body;
+    const newQty = parseInt(quantity, 10);
+
+    const [item] = await query(`SELECT * FROM ecp_cart_items WHERE id = $1`, [id]);
+    if (!item) {
+      return res.status(404).json({ success: false, message: 'Cart item not found' });
+    }
+
+    const cart = await getOrCreateCart(req);
+
+    if (newQty <= 0) {
+      await query(`DELETE FROM ecp_cart_items WHERE id = $1`, [id]);
+      const data = await getCartPayload(cart.id, cart.session_id, cart.coupon_code);
+      return res.json({ success: true, message: 'تم حذف الصنف من السلة', data });
+    }
+
+    // Verify stock
+    const [bBal] = await query(
+      `SELECT available_qty FROM inventory_balances
+       WHERE branch_id = $1 AND product_id = $2 AND (variant_id = $3 OR ($3 IS NULL AND variant_id IS NULL))`,
+      [ONLINE_BRANCH_ID, item.product_id, item.variant_id]
+    );
+
+    const availableStock = bBal ? parseInt(bBal.available_qty, 10) : 0;
+    if (availableStock < newQty) {
+      return res.status(400).json({
+        success: false,
+        message: `الكمية المتاحة في المخزن (${availableStock}) فقط.`
+      });
+    }
+
+    await query(
+      `UPDATE ecp_cart_items SET quantity = $1, updated_at = NOW() WHERE id = $2`,
+      [newQty, id]
+    );
+
+    const data = await getCartPayload(cart.id, cart.session_id, cart.coupon_code);
+    return res.json({ success: true, message: 'تم تحديث الكمية بنجاح', data });
+  } catch (err) {
+    console.error('ECP update cart item error:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * DELETE /api/ecp/cart/items/:id
+ * Remove item from cart
+ */
+router.delete('/items/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const cart = await getOrCreateCart(req);
+    await query(`DELETE FROM ecp_cart_items WHERE id = $1 AND cart_id = $2`, [id, cart.id]);
+    const data = await getCartPayload(cart.id, cart.session_id, cart.coupon_code);
+    return res.json({ success: true, message: 'تم حذف الصنف من السلة', data });
+  } catch (err) {
+    console.error('ECP delete cart item error:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/**
+ * DELETE /api/ecp/cart
+ * Empty all items from cart
+ */
+router.delete('/', async (req, res) => {
+  try {
+    const cart = await getOrCreateCart(req);
+    await query(`DELETE FROM ecp_cart_items WHERE cart_id = $1`, [cart.id]);
+    const data = await getCartPayload(cart.id, cart.session_id, cart.coupon_code);
+    return res.json({ success: true, message: 'تم تفريغ السلة بنجاح', data });
+  } catch (err) {
+    console.error('ECP clear cart error:', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+module.exports = router;
