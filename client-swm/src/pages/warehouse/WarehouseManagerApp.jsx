@@ -39,7 +39,8 @@ import {
   Sparkles,
   Menu,
   X,
-  Home
+  Home,
+  Palette
 } from 'lucide-react';
 import ScrollToTopTabs from '../../components/ScrollToTopTabs';
 import api from '../../api';
@@ -47,6 +48,7 @@ import yokaLogo from '../../assets/yokaStoreTransparent.png';
 
 // Sub-Pages
 import GroupsAndItems from '../GroupsAndItems';
+import ColorsAndSizes from './ColorsAndSizes';
 import StockAudit from '../StockAudit';
 import Transfers from '../Transfers';
 import Purchases from '../Purchases';
@@ -108,7 +110,7 @@ export default function WarehouseManagerApp({ currentUser, onLogout }) {
   }, [currentUser?.id]);
 
   const validTabs = useMemo(() => new Set([
-    'home', 'groups_items', 'stock_audit', 'purchases', 'suppliers',
+    'home', 'groups_items', 'colors_sizes', 'stock_audit', 'purchases', 'suppliers',
     'inventory_counts', 'stock_adjustments', 'transfers', 'alerts',
     'analytics', 'system_backup', 'permissions',
     'payroll_expenses', 'payroll', 'branches', 'users',
@@ -166,6 +168,12 @@ export default function WarehouseManagerApp({ currentUser, onLogout }) {
         title: 'المجموعات والأصناف',
         subtitle: 'شجرة التصنيفات، المقاسات، الألوان، ومواصفات الأصناف',
         icon: <Layers size={20} color="#16a34a" />
+      },
+      p.perm_groups_items !== false && {
+        id: 'colors_sizes',
+        title: 'إدارة الألوان والمقاسات',
+        subtitle: 'باليت الألوان وأكواد Hex، المقاسات القياسية والمخصصة، ومطابقة المخزون',
+        icon: <Palette size={20} color="#16a34a" />
       },
       p.perm_stock_audit !== false && {
         id: 'stock_audit',
@@ -276,7 +284,8 @@ export default function WarehouseManagerApp({ currentUser, onLogout }) {
     if (activeTab === 'home') return true;
     const p = permissions || {};
     switch (activeTab) {
-      case 'groups_items': return p.perm_groups_items !== false;
+      case 'groups_items':
+      case 'colors_sizes': return p.perm_groups_items !== false;
       case 'stock_audit':
       case 'stock_adjustments': return p.perm_stock_audit !== false;
       case 'transfers': return p.perm_transfers !== false;
@@ -993,6 +1002,9 @@ export default function WarehouseManagerApp({ currentUser, onLogout }) {
                 autoOpenCreate={tabExtra?.autoOpenCreate}
                 onResetAction={() => setTabExtra(null)}
               />
+            )}
+            {activeTab === 'colors_sizes' && (
+              <ColorsAndSizes currentUser={currentUser} />
             )}
             {(activeTab === 'stock_audit' || activeTab === 'stock_adjustments') && (
               <StockAudit currentUser={currentUser} />
