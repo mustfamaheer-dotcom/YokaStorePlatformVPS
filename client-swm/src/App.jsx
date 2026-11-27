@@ -40,7 +40,8 @@ function ProtectedRoute({ currentUser, allowedRoles, requiredBranchType, childre
   const isEcom = isEcomWarehouseUser(currentUser);
   const isAdmin = ['admin', 'super_admin'].includes(currentUser.role);
   const isSupervisor = currentUser.role === 'supervisor' || currentUser.isSupervisor === true;
-  const isAllowed = allowedRoles.includes(currentUser.role) || (isSupervisor && allowedRoles.includes('supervisor')) || (isAdmin && allowedRoles.includes('admin'));
+  const isSalesperson = currentUser.role === 'salesperson' || currentUser.role === 'branch_account';
+  const isAllowed = allowedRoles.includes(currentUser.role) || (isSalesperson && allowedRoles.includes('salesperson')) || (isSupervisor && allowedRoles.includes('supervisor')) || (isAdmin && allowedRoles.includes('admin'));
 
   const shouldBounceEcom = isEcom && !isAdmin && (location.pathname === '/pos' || location.pathname.startsWith('/supervisor'));
   const shouldBounceReqEcom = requiredBranchType === 'ecom_warehouse' && !isEcom && !isAdmin;

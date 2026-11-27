@@ -549,7 +549,7 @@ router.post('/refresh', async (req, res) => {
       }
 
       const isMain = branch.branch_type === 'main_warehouse';
-      const defaultRole = isMain ? 'admin' : 'branch_account';
+      const defaultRole = isMain ? 'admin' : 'salesperson';
       const payload = {
         id: branch.id,
         branchId: branch.id,
