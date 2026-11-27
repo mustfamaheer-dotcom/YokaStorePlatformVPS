@@ -482,6 +482,8 @@ export default function POS({ currentUser }) {
       const params = {};
       if (q && q.trim()) params.query = q.trim();
       if (catId && catId !== 'all') params.category_id = catId;
+      if (invoiceType === 'sale') params.in_stock_only = 'true';
+      if (sessionData?.register?.branch_id) params.branch_id = sessionData.register.branch_id;
 
       const res = await api.get('/api/swm/pos/search', { params });
       if (res.data.success) {
@@ -637,7 +639,10 @@ export default function POS({ currentUser }) {
       }
 
       try {
-        const res = await api.get('/api/swm/pos/search', { params: { query: cleanCode } });
+        const searchParams = { query: cleanCode };
+        if (invoiceType === 'sale') searchParams.in_stock_only = 'true';
+        if (sessionData?.register?.branch_id) searchParams.branch_id = sessionData.register.branch_id;
+        const res = await api.get('/api/swm/pos/search', { params: searchParams });
         if (res.data.success && res.data.data.length > 0) {
           const product = res.data.data[0];
           if (invoiceType === 'sale' && product.available_qty <= 0) {

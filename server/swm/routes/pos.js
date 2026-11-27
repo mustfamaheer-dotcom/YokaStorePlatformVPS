@@ -582,10 +582,13 @@ router.get('/search', requireAuth, requireBranchScope, async (req, res) => {
     } else {
       branchId = parseInt(branchId, 10);
     }
-    const { query: searchQuery, category_id, limit = 500 } = req.query;
+    const { query: searchQuery, category_id, limit = 500, in_stock_only } = req.query;
     const limitNum = Math.min(1000, parseInt(limit, 10) || 500);
 
     const whereClauses = [`p.status = 'active'`];
+    if (in_stock_only === 'true' || in_stock_only === '1') {
+      whereClauses.push(`COALESCE(ib_var.available_qty, ib_base.available_qty, 0) > 0`);
+    }
     const params = [branchId];
     let pIdx = 2;
 
