@@ -57,7 +57,8 @@ import api from '../api';
 import yokaLogo from '../assets/yokaStoreTransparent.png';
 import BarcodeImage from '../components/BarcodeImage';
 import { generateValidEAN13 } from '../utils/barcode';
-import { canDelete } from '../utils/permissions';
+import { canDelete, canDeleteProduct, isMainWarehouse } from '../utils/permissions';
+import useDebounce from '../hooks/useDebounce';
 
 const { Title, Text, Paragraph } = Typography;
 const { Option } = Select;
@@ -155,9 +156,10 @@ export default function GroupsAndItems({ currentUser: propUser, autoOpenCreate, 
   const [items, setItems] = useState([]);
   const [itemsLoading, setItemsLoading] = useState(false);
   const [itemSearch, setItemSearch] = useState('');
+  const debouncedItemSearch = useDebounce(itemSearch, 300);
   const [selectedCategoryFilter, setSelectedCategoryFilter] = useState(undefined);
   const [selectedStatusFilter, setSelectedStatusFilter] = useState(undefined);
-  const [itemsPagination, setItemsPagination] = useState({ current: 1, pageSize: 5000, total: 0 });
+  const [itemsPagination, setItemsPagination] = useState({ current: 1, pageSize: 50, total: 0 });
 
   // Product Inspection / Review Modal State
   const [productReviewModalVisible, setProductReviewModalVisible] = useState(false);
@@ -195,7 +197,8 @@ export default function GroupsAndItems({ currentUser: propUser, autoOpenCreate, 
     ? selectedMultiColors
     : (watchedItemColor ? [watchedItemColor] : []);
 
-  const canManageItem = canDelete(currentUser) || ['super_admin', 'admin', 'warehouse_manager'].includes(currentUser?.role);
+  const isMainWh = isMainWarehouse(currentUser);
+  const canManageItem = canDelete(currentUser) || canDeleteProduct(currentUser) || isMainWh || ['super_admin', 'admin', 'warehouse_manager'].includes(currentUser?.role);
 
 
   // ==========================================
@@ -231,14 +234,14 @@ export default function GroupsAndItems({ currentUser: propUser, autoOpenCreate, 
     }
   };
 
-  const fetchItems = async (page = 1) => {
+  const fetchItems = async (page = 1, currentSearch = debouncedItemSearch) => {
     setItemsLoading(true);
     try {
       const res = await api.get('/api/swm/products', {
         params: {
           page,
           limit: itemsPagination.pageSize,
-          search: itemSearch || undefined,
+          search: currentSearch || undefined,
           category_id: selectedCategoryFilter || undefined,
           status: selectedStatusFilter || undefined
         }
@@ -264,8 +267,8 @@ export default function GroupsAndItems({ currentUser: propUser, autoOpenCreate, 
   }, []);
 
   useEffect(() => {
-    fetchItems(1);
-  }, [itemSearch, selectedCategoryFilter, selectedStatusFilter]);
+    fetchItems(1, debouncedItemSearch);
+  }, [debouncedItemSearch, selectedCategoryFilter, selectedStatusFilter, itemsPagination.pageSize]);
 
   // ==========================================
   // GROUPS HANDLERS
@@ -825,16 +828,16 @@ export default function GroupsAndItems({ currentUser: propUser, autoOpenCreate, 
     }
   };
 
-  // Filtered categories for search
-  const filteredCategories = categories.filter(c => {
-    if (!categorySearch.trim()) return true;
-    const q = categorySearch.toLowerCase();
-    return (
+  // Filtered categories for search (memoized)
+  const filteredCategories = React.useMemo(() => {
+    if (!categorySearch.trim()) return categories;
+    const q = categorySearch.toLowerCase().trim();
+    return categories.filter(c =>
       (c.category_name && c.category_name.toLowerCase().includes(q)) ||
       (c.slug && c.slug.toLowerCase().includes(q)) ||
       (c.description && c.description.toLowerCase().includes(q))
     );
-  });
+  }, [categories, categorySearch]);
 
   // Calculate quick stats
   const totalCategoriesCount = categories.length;
@@ -931,7 +934,7 @@ export default function GroupsAndItems({ currentUser: propUser, autoOpenCreate, 
           >
             تعديل
           </Button>
-          {canDelete(currentUser) && (
+          {(canDelete(currentUser) || canDeleteProduct(currentUser)) && (
             <Popconfirm
               title="تأكيد حذف المجموعة"
               description={
@@ -988,7 +991,7 @@ export default function GroupsAndItems({ currentUser: propUser, autoOpenCreate, 
       render: (_, record) => (
         <Space>
           <Button size="small" icon={<EditOutlined />} onClick={() => handleOpenEditAttr(record)} />
-          {canDelete(currentUser) && (
+          {(canDelete(currentUser) || canDeleteProduct(currentUser)) && (
             <Popconfirm
               title="حذف المقاس"
               description="هل أنت متأكد من حذف هذا المقاس من القائمة؟"
@@ -1053,7 +1056,7 @@ export default function GroupsAndItems({ currentUser: propUser, autoOpenCreate, 
       render: (_, record) => (
         <Space>
           <Button size="small" icon={<EditOutlined />} onClick={() => handleOpenEditAttr(record)} />
-          {canDelete(currentUser) && (
+          {(canDelete(currentUser) || canDeleteProduct(currentUser)) && (
             <Popconfirm
               title="حذف اللون"
               description="هل أنت متأكد من حذف هذا اللون من القائمة؟"
@@ -1303,7 +1306,7 @@ export default function GroupsAndItems({ currentUser: propUser, autoOpenCreate, 
                       <div style={{ maxWidth: 280 }}>
                         هل أنت متأكد من حذف الصنف <strong>"{record.product_name}"</strong> نهائياً من قاعدة البيانات؟
                         <div style={{ fontSize: 11, color: '#ef4444', marginTop: 4 }}>
-                          ملاحظة: سيتم الحذف فقط إذا لم تكن هناك حركات مسجلة تعتمد عليه.
+                          سيتم مسح الصنف وجميع متغيراته وسجلاته نهائياً من النظام.
                         </div>
                       </div>
                     }
@@ -1321,17 +1324,17 @@ export default function GroupsAndItems({ currentUser: propUser, autoOpenCreate, 
             ) : (
               canManageItem && (
                 <Popconfirm
-                  title="تأكيد حذف / أرشفة الصنف"
+                  title="تأكيد حذف الصنف نهائياً من النظام"
                   description={
                     <div style={{ maxWidth: 280 }}>
                       هل أنت متأكد من حذف الصنف <strong>"{record.product_name}"</strong>؟
-                      <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
-                        سيتم حذفه نهائياً إذا لم تكن هناك حركات مسجلة، أو أرشفته تلقائياً للحفاظ على السجلات المحاسبية والمبيعات.
+                      <div style={{ fontSize: 11, color: '#ef4444', marginTop: 4 }}>
+                        سيتم مسح الصنف ومتغيراته وكافة سجلاته وحركاته نهائياً من النظام والشاشات.
                       </div>
                     </div>
                   }
                   onConfirm={() => handleDeleteItem(record.id)}
-                  okText="نعم، احذف"
+                  okText="نعم، حذف نهائي"
                   cancelText="إلغاء"
                   okButtonProps={{ danger: true }}
                 >
@@ -1711,10 +1714,10 @@ export default function GroupsAndItems({ currentUser: propUser, autoOpenCreate, 
                       </Button>
                       {canManageItem && (
                         <Popconfirm
-                          title="حذف الأصناف المحددة دفعة واحدة"
-                          description={`هل أنت متأكد من حذف ${selectedItemRowKeys.length} صنف دفعة واحدة؟ (سيتم حذف الأصناف التي لا تحتوي على حركات نهائياً، وأرشفة الأصناف المرتبطة بفواتير أو حركات للحفاظ على السجلات المالية)`}
+                          title="حذف الأصناف المحددة نهائياً"
+                          description={`هل أنت متأكد من حذف (${selectedItemRowKeys.length}) صنف دفعة واحدة؟ سيتم مسح الأصناف المحددة نهائياً من كافة سجلات وقاعدة بيانات النظام.`}
                           onConfirm={handleBulkDeleteItems}
-                          okText="نعم، حذف الكل"
+                          okText="نعم، حذف الكل نهائياً"
                           cancelText="تراجع"
                           okButtonProps={{ danger: true, loading: bulkDeletingItems }}
                         >
@@ -1739,7 +1742,18 @@ export default function GroupsAndItems({ currentUser: propUser, autoOpenCreate, 
                   rowKey="id"
                   loading={itemsLoading}
                   scroll={{ x: 'max-content' }}
-                  pagination={false}
+                  pagination={{
+                    current: itemsPagination.current,
+                    pageSize: itemsPagination.pageSize,
+                    total: itemsPagination.total,
+                    showSizeChanger: true,
+                    pageSizeOptions: ['20', '50', '100', '200'],
+                    showTotal: (total, range) => `عرض ${range[0]}-${range[1]} من إجمالي ${total} صنف`,
+                    onChange: (page, pageSize) => {
+                      setItemsPagination(prev => ({ ...prev, current: page, pageSize }));
+                      fetchItems(page, debouncedItemSearch);
+                    }
+                  }}
                   bordered
                   size="middle"
                   rowSelection={{

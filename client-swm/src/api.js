@@ -6,6 +6,7 @@ const BASE_URL = import.meta.env.VITE_API_URL !== undefined
 
 const api = axios.create({
   baseURL: BASE_URL,
+  timeout: 120000, // 2 minutes timeout to comfortably handle large bulk transactions
   headers: {
     'Content-Type': 'application/json'
   }
@@ -67,7 +68,7 @@ api.interceptors.response.use(
       const refreshToken = localStorage.getItem('refreshToken');
       if (!refreshToken) {
         localStorage.clear();
-        window.location.href = window.location.pathname.startsWith('/swm-admin') ? '/swm-admin/login' : '/swm-admin/login';
+        window.location.href = window.location.pathname.startsWith('/swm-admin') ? '/swm-admin/login' : '/login';
         return Promise.reject(error);
       }
 
@@ -91,7 +92,7 @@ api.interceptors.response.use(
       } catch (refreshErr) {
         processQueue(refreshErr, null);
         localStorage.clear();
-        window.location.href = window.location.pathname.startsWith('/swm-admin') ? '/swm-admin/login' : '/swm-admin/login';
+        window.location.href = window.location.pathname.startsWith('/swm-admin') ? '/swm-admin/login' : '/login';
         return Promise.reject(refreshErr);
       } finally {
         isRefreshing = false;

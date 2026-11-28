@@ -52,6 +52,7 @@ import {
 import api from '../api';
 import ThermalReceipt from '../components/ThermalReceipt';
 import CustomerLookup from '../components/CustomerLookup';
+import useDebounce from '../hooks/useDebounce';
 
 const { Title, Text } = Typography;
 const { Option } = Select;
@@ -137,6 +138,7 @@ export default function POS({ currentUser }) {
   const [categories, setCategories] = useState([]);
   const [selectedCategory, setSelectedCategory] = useState('all');
   const [modalSearchQuery, setModalSearchQuery] = useState('');
+  const debouncedModalSearchQuery = useDebounce(modalSearchQuery, 250);
   const [modalProducts, setModalProducts] = useState([]);
   const [modalLoading, setModalLoading] = useState(false);
   const modalSearchInputRef = useRef(null);
@@ -498,14 +500,18 @@ export default function POS({ currentUser }) {
   // Category clicked in F1 modal sidebar
   const handleCategorySelect = (catId) => {
     setSelectedCategory(catId);
-    fetchModalProducts(modalSearchQuery, catId);
   };
 
-  // Search input changed in F1 modal
+  // Search input changed in F1 modal (instant typing)
   const handleModalSearchChange = (val) => {
     setModalSearchQuery(val);
-    fetchModalProducts(val, selectedCategory);
   };
+
+  useEffect(() => {
+    if (searchModalVisible) {
+      fetchModalProducts(debouncedModalSearchQuery, selectedCategory);
+    }
+  }, [debouncedModalSearchQuery, selectedCategory, searchModalVisible]);
 
   // Product selected from F1 modal: automatically appended/populated into current row
   const handleSelectProductFromModal = (product) => {

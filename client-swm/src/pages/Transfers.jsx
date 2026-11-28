@@ -1,6 +1,7 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Home as HomeIcon, Keyboard, Search, Zap } from 'lucide-react';
+import useDebounce from '../hooks/useDebounce';
 import {
   Card,
   Row,
@@ -95,6 +96,7 @@ export default function Transfers({ currentUser, autoOpenCreate, onResetAction }
   // F1 Product Search Modal State
   const [searchModalVisible, setSearchModalVisible] = useState(false);
   const [modalSearchQuery, setModalSearchQuery] = useState('');
+  const debouncedModalSearchQuery = useDebounce(modalSearchQuery, 180);
   const [modalCategoryFilter, setModalCategoryFilter] = useState('all');
 
   // Input Refs for fast keyboard navigation
@@ -192,6 +194,35 @@ export default function Transfers({ currentUser, autoOpenCreate, onResetAction }
     }
   };
 
+  // Silent Keep-Alive Heartbeat: Pings server every 4 minutes while user is preparing transfers
+  // Guarantees JWT accessToken never expires during long inventory entries
+  useEffect(() => {
+    const keepAliveInterval = setInterval(async () => {
+      try {
+        await api.get('/api/auth/me');
+      } catch (e) {
+        // Silently handled by axios interceptor
+      }
+    }, 4 * 60 * 1000);
+
+    return () => clearInterval(keepAliveInterval);
+  }, []);
+
+  // Auto-save draft items in sessionStorage to protect user work against unexpected browser reloads
+  useEffect(() => {
+    if (!createModalVisible) return;
+    try {
+      const valid = transferItems.filter((i) => i.product_id);
+      if (valid.length > 0) {
+        sessionStorage.setItem('yoka_transfer_draft', JSON.stringify({
+          items: transferItems,
+          from_branch_id: selectedFromBranch,
+          to_branch_id: selectedToBranch
+        }));
+      }
+    } catch (e) {}
+  }, [transferItems, selectedFromBranch, selectedToBranch, createModalVisible]);
+
   useEffect(() => {
     fetchBranches();
     fetchMetrics();
@@ -225,40 +256,62 @@ export default function Transfers({ currentUser, autoOpenCreate, onResetAction }
     const mainBranch = branches.find((b) => b.branch_type === 'main_warehouse');
     const defaultBranchId = mainBranch ? mainBranch.id : (branches[0]?.id || undefined);
 
+    let restoredItems = null;
+    let savedFromBranch = defaultBranchId;
+    let savedToBranch = undefined;
+    try {
+      const rawDraft = sessionStorage.getItem('yoka_transfer_draft');
+      if (rawDraft) {
+        const parsed = JSON.parse(rawDraft);
+        if (parsed.items && parsed.items.some((i) => i.product_id)) {
+          restoredItems = parsed.items;
+          if (parsed.from_branch_id) savedFromBranch = parsed.from_branch_id;
+          if (parsed.to_branch_id) savedToBranch = parsed.to_branch_id;
+        }
+      }
+    } catch (e) {}
+
     createForm.setFieldsValue({
-      from_branch_id: defaultBranchId,
+      from_branch_id: savedFromBranch,
+      to_branch_id: savedToBranch,
       transfer_date: dayjs()
     });
 
-    if (defaultBranchId) {
-      fetchBranchStock(defaultBranchId);
+    if (savedFromBranch) {
+      fetchBranchStock(savedFromBranch);
     }
 
-    const firstKey = `row-${Date.now()}-1`;
-    setTransferItems([
-      {
-        key: firstKey,
-        isManualRow: true,
-        product_id: null,
-        variant_id: null,
-        barcode_input: '',
-        product_name: '',
-        display_name: '',
-        color: null,
-        size: null,
-        product_code: '',
-        barcode: '',
-        available_qty: 0,
-        quantity: 1,
-        notes: ''
-      }
-    ]);
-    setActiveRowKey(firstKey);
-    setCreateModalVisible(true);
+    if (restoredItems && restoredItems.length > 0) {
+      setTransferItems(restoredItems);
+      setActiveRowKey(restoredItems[0]?.key || null);
+      message.info('تمت استعادة مسودة الأصناف غير المحفوظة لتجنب فقدان مدخلاتك.');
+    } else {
+      const firstKey = `row-${Date.now()}-1`;
+      setTransferItems([
+        {
+          key: firstKey,
+          isManualRow: true,
+          product_id: null,
+          variant_id: null,
+          barcode_input: '',
+          product_name: '',
+          display_name: '',
+          color: null,
+          size: null,
+          product_code: '',
+          barcode: '',
+          available_qty: 0,
+          quantity: 1,
+          notes: ''
+        }
+      ]);
+      setActiveRowKey(firstKey);
+      setTimeout(() => {
+        rowBarcodeRefs.current[firstKey]?.focus();
+      }, 200);
+    }
 
-    setTimeout(() => {
-      rowBarcodeRefs.current[firstKey]?.focus();
-    }, 200);
+    setCreateModalVisible(true);
   };
 
   useEffect(() => {
@@ -1007,6 +1060,9 @@ export default function Transfers({ currentUser, autoOpenCreate, onResetAction }
 
       const res = await api.post('/api/swm/transfers', payload);
       if (res.data.success) {
+        try {
+          sessionStorage.removeItem('yoka_transfer_draft');
+        } catch (e) {}
         message.success(res.data.message || 'تم حفظ وتنفيذ إذن الصرف ونقل المخزون بنجاح [F4]');
         setCreateModalVisible(false);
         fetchMetrics();
@@ -1035,31 +1091,34 @@ export default function Transfers({ currentUser, autoOpenCreate, onResetAction }
     }
   };
 
-  // Filtered products inside F1 modal
-  const filteredModalProducts = availableStock.filter((item) => {
-    const q = modalSearchQuery.toLowerCase().trim();
-    const matchQuery =
-      !q ||
-      (item.product_name || '').toLowerCase().includes(q) ||
-      (item.display_name || '').toLowerCase().includes(q) ||
-      (item.product_code || '').toLowerCase().includes(q) ||
-      (item.barcode || '').toLowerCase().includes(q) ||
-      (item.variant_sku || '').toLowerCase().includes(q) ||
-      (item.color || '').toLowerCase().includes(q) ||
-      (item.size || '').toLowerCase().includes(q);
+  // Filtered products inside F1 modal (memoized with debounce for smooth typing)
+  const filteredModalProducts = useMemo(() => {
+    if (!debouncedModalSearchQuery.trim() && modalCategoryFilter === 'all') return availableStock;
+    const q = debouncedModalSearchQuery.toLowerCase().trim();
+    return availableStock.filter((item) => {
+      const matchQuery =
+        !q ||
+        (item.product_name || '').toLowerCase().includes(q) ||
+        (item.display_name || '').toLowerCase().includes(q) ||
+        (item.product_code || '').toLowerCase().includes(q) ||
+        (item.barcode || '').toLowerCase().includes(q) ||
+        (item.variant_sku || '').toLowerCase().includes(q) ||
+        (item.color || '').toLowerCase().includes(q) ||
+        (item.size || '').toLowerCase().includes(q);
 
-    const matchCategory =
-      modalCategoryFilter === 'all' ||
-      String(item.category_id) === String(modalCategoryFilter) ||
-      item.category_name === modalCategoryFilter;
+      const matchCategory =
+        modalCategoryFilter === 'all' ||
+        String(item.category_id) === String(modalCategoryFilter) ||
+        item.category_name === modalCategoryFilter;
 
-    return matchQuery && matchCategory;
-  });
+      return matchQuery && matchCategory;
+    });
+  }, [availableStock, debouncedModalSearchQuery, modalCategoryFilter]);
 
-  // Extract unique categories from current branch stock for quick filter pills
-  const availableCategories = Array.from(
-    new Set(availableStock.map((s) => s.category_name).filter(Boolean))
-  );
+  // Extract unique categories from current branch stock for quick filter pills (memoized)
+  const availableCategories = useMemo(() => {
+    return Array.from(new Set(availableStock.map((s) => s.category_name).filter(Boolean)));
+  }, [availableStock]);
 
   // Transfers List Table Columns
   const columns = [

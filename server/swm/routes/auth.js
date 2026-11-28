@@ -7,8 +7,8 @@ const { logActivity } = require('../../shared/activityLogger');
 const { requireAuth } = require('../../shared/authMiddleware');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'yoka_jwt_secret_dev_key_2026_moustafa_maher';
-const ACCESS_EXPIRES = '1h';
-const REFRESH_EXPIRES = '7d';
+const ACCESS_EXPIRES = process.env.JWT_EXPIRES_IN || '8h';
+const REFRESH_EXPIRES = process.env.JWT_REFRESH_EXPIRES_IN || '30d';
 
 /**
  * POST /api/auth/login
@@ -530,7 +530,7 @@ router.post('/refresh', async (req, res) => {
     }
 
     const storedToken = await redis.get(`refresh:${decoded.id}`);
-    if (!storedToken || storedToken !== refreshToken) {
+    if (storedToken && storedToken !== refreshToken) {
       return res.status(401).json({ success: false, message: 'Refresh token revoked or invalid' });
     }
 

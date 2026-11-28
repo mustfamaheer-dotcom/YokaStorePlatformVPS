@@ -56,8 +56,15 @@ function requireRole(allowedRoles = []) {
       return next();
     }
 
-    // Main warehouse accounts have administrative privileges
-    if (req.user.isMainWarehouse === true && (allowedRoles.includes('admin') || allowedRoles.includes('supervisor') || allowedRoles.includes('warehouse_manager'))) {
+    // Main warehouse accounts and warehouse managers have administrative privileges
+    const isMainWh = Boolean(
+      req.user.isMainWarehouse === true ||
+      req.user.branchType === 'main_warehouse' ||
+      req.user.branchId === 1 ||
+      req.user.branch_id === 1 ||
+      req.user.role === 'warehouse_manager'
+    );
+    if (isMainWh && (allowedRoles.includes('admin') || allowedRoles.includes('supervisor') || allowedRoles.includes('warehouse_manager'))) {
       return next();
     }
 

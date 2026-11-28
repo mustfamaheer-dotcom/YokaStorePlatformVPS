@@ -80,9 +80,9 @@ router.use(requireWarehousePermission('groups_items'));
  */
 router.get('/', requireAuth, async (req, res) => {
   try {
-    const { page = 1, limit = 5000, search, category_id, branch_id, status } = req.query;
+    const { page = 1, limit = 50, search, category_id, branch_id, status } = req.query;
     const pageNum = Math.max(1, parseInt(page, 10));
-    const limitNum = Math.max(1, Math.min(10000, parseInt(limit, 10) || 5000));
+    const limitNum = Math.max(1, Math.min(500, parseInt(limit, 10) || 50));
     const offset = (pageNum - 1) * limitNum;
 
     const whereClauses = [];
@@ -119,6 +119,7 @@ router.get('/', requireAuth, async (req, res) => {
     }
 
     const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+    const countParams = [...params];
 
     let branchJoinSql = '';
     if (branch_id) {
@@ -127,43 +128,56 @@ router.get('/', requireAuth, async (req, res) => {
       pIdx++;
     }
 
-    // Query Total Count
+    // Query Total Count (fast index count)
     const countSql = `SELECT COUNT(DISTINCT p.id) AS total FROM products p ${whereSql}`;
-    const countResult = await query(countSql, params.slice(0, branch_id ? pIdx - 2 : pIdx - 1));
+    const countResult = await query(countSql, countParams);
     const total = parseInt(countResult[0]?.total || 0, 10);
 
-    // Query Data
+    // High-speed CTE pagination: filter & paginate first, then aggregate ONLY the 50 items
     const dataSql = `
-      SELECT p.id, p.product_code, p.barcode, p.product_name, p.slug, p.brand,
-             p.cost_price, p.selling_price, p.wholesale_price, p.sale_price,
-             p.status, p.is_ecom_listed, p.is_featured, p.category_id, p.featured_image,
-             p.color AS base_color, p.size AS base_size,
+      WITH filtered_products AS (
+        SELECT p.id, p.product_code, p.barcode, p.product_name, p.slug, p.brand,
+               p.cost_price, p.selling_price, p.wholesale_price, p.sale_price,
+               p.status, p.is_ecom_listed, p.is_featured, p.category_id, p.featured_image,
+               p.color AS base_color, p.size AS base_size
+        FROM products p
+        ${whereSql}
+        ORDER BY p.id DESC
+        LIMIT ${limitNum} OFFSET ${offset}
+      )
+      SELECT fp.*,
+             c.category_name,
              COALESCE(
                NULLIF(STRING_AGG(DISTINCT v.color, ' / ') FILTER (WHERE v.color IS NOT NULL AND v.color != ''), ''),
-               p.color,
+               fp.base_color,
                ''
              ) AS color,
              COALESCE(
                NULLIF(STRING_AGG(DISTINCT v.size, ' / ') FILTER (WHERE v.size IS NOT NULL AND v.size != ''), ''),
-               p.size,
+               fp.base_size,
                ''
              ) AS size,
-             c.category_name,
-             COALESCE(SUM(ib.available_qty), 0) AS total_stock,
+             COALESCE(st.total_stock, 0) AS total_stock,
              COUNT(DISTINCT v.id) AS variant_count,
              COALESCE(
                JSON_AGG(DISTINCT JSONB_BUILD_OBJECT('color', v.color, 'image_url', v.image_url))
                FILTER (WHERE v.id IS NOT NULL AND v.color IS NOT NULL),
                '[]'::json
              ) AS color_variants
-      FROM products p
-      LEFT JOIN product_categories c ON c.id = p.category_id
-      LEFT JOIN product_variants v ON v.product_id = p.id
-      LEFT JOIN inventory_balances ib ON ib.product_id = p.id ${branchJoinSql}
-      ${whereSql}
-      GROUP BY p.id, c.category_name
-      ORDER BY p.id DESC
-      LIMIT ${limitNum} OFFSET ${offset}
+      FROM filtered_products fp
+      LEFT JOIN product_categories c ON c.id = fp.category_id
+      LEFT JOIN product_variants v ON v.product_id = fp.id
+      LEFT JOIN (
+        SELECT ib.product_id, SUM(ib.available_qty) AS total_stock
+        FROM inventory_balances ib
+        WHERE ib.product_id IN (SELECT id FROM filtered_products) ${branchJoinSql}
+        GROUP BY ib.product_id
+      ) st ON st.product_id = fp.id
+      GROUP BY fp.id, fp.product_code, fp.barcode, fp.product_name, fp.slug, fp.brand,
+               fp.cost_price, fp.selling_price, fp.wholesale_price, fp.sale_price,
+               fp.status, fp.is_ecom_listed, fp.is_featured, fp.category_id, fp.featured_image,
+               fp.base_color, fp.base_size, c.category_name, st.total_stock
+      ORDER BY fp.id DESC
     `;
 
     const products = await query(dataSql, params);
@@ -908,8 +922,8 @@ router.put('/:id', requireAuth, requireRole(['super_admin', 'admin', 'inventory_
           if (!matchedVar) {
             matchedVar = existingVariants.find(
               ev => !matchedExistingIds.has(ev.id) &&
-                    (ev.color || null) === vColor &&
-                    (ev.size || null) === vSize
+                (ev.color || null) === vColor &&
+                (ev.size || null) === vSize
             );
           }
 
@@ -1005,7 +1019,7 @@ router.put('/:id', requireAuth, requireRole(['super_admin', 'admin', 'inventory_
       const keys = await redis.keys('ecp:cache:*');
       if (keys && keys.length > 0) await redis.del(...keys);
       if (old.slug) await redis.del(`ecp:seo:product:${old.slug}`);
-    } catch (e) {}
+    } catch (e) { }
 
     const priceChanged = selling_price !== undefined && parseFloat(selling_price) !== parseFloat(old.selling_price);
 
@@ -1110,7 +1124,7 @@ router.patch('/:id/price', requireAuth, requireRole(['super_admin', 'admin', 'in
       await redis.del(`ecp:seo:product:${old.slug}`);
       const catalogKeys = await redis.keys('ecp:catalog:*');
       if (catalogKeys.length > 0) await redis.del(catalogKeys);
-    } catch (e) {}
+    } catch (e) { }
 
     return res.json({
       success: true,
@@ -1202,63 +1216,84 @@ router.post('/:id/variants', requireAuth, requireRole(['super_admin', 'admin', '
 });
 
 /**
- * DELETE /api/swm/products/:id
- * Delete product permanently if no history, or archive if transaction history exists
+ * Permanently cascade-deletes a product and all of its associated records from all system tables.
  */
-router.delete('/:id', requireAuth, requireRole(['super_admin', 'admin']), async (req, res) => {
+async function cascadeDeleteProduct(client, productId) {
+  // 1. Gather all variant IDs for this product
+  const varRes = await client.query(`SELECT id FROM product_variants WHERE product_id = $1`, [productId]);
+  const variantIds = varRes.rows ? varRes.rows.map(r => r.id) : (Array.isArray(varRes) ? varRes.map(r => r.id) : []);
+
+  // 2. Cascade delete from variant referencing tables
+  if (variantIds.length > 0) {
+    const varTables = [
+      'ecp_cart_items',
+      'ecp_order_items',
+      'stock_transfer_items',
+      'stock_adjustment_items',
+      'purchase_return_items',
+      'swm_sales_invoice_items',
+      'purchase_invoice_items',
+      'inventory_movements',
+      'inventory_counts',
+      'inventory_balances'
+    ];
+    for (const tbl of varTables) {
+      try {
+        await client.query(`DELETE FROM ${tbl} WHERE variant_id = ANY($1::int[])`, [variantIds]);
+      } catch (err) { }
+    }
+  }
+
+  // 3. Cascade delete from product referencing tables
+  const prodTables = [
+    'ecp_cart_items',
+    'ecp_reviews',
+    'ecp_order_items',
+    'stock_transfer_items',
+    'stock_adjustment_items',
+    'purchase_return_items',
+    'swm_sales_invoice_items',
+    'purchase_invoice_items',
+    'inventory_movements',
+    'inventory_counts',
+    'inventory_balances'
+  ];
+  for (const tbl of prodTables) {
+    try {
+      await client.query(`DELETE FROM ${tbl} WHERE product_id = $1`, [productId]);
+    } catch (err) { }
+  }
+
+  // 4. Delete product_variants
+  await client.query(`DELETE FROM product_variants WHERE product_id = $1`, [productId]);
+
+  // 5. Delete from products
+  const delRes = await client.query(`DELETE FROM products WHERE id = $1 RETURNING id, product_name`, [productId]);
+  return delRes.rows ? delRes.rows[0] : delRes[0];
+}
+
+/**
+ * DELETE /api/swm/products/:id
+ * Delete product permanently from all system tables (Owner & Main Warehouse)
+ */
+router.delete('/:id', requireAuth, requireRole(['super_admin', 'admin', 'warehouse_manager']), async (req, res) => {
   try {
     const { id } = req.params;
     const [product] = await query(`SELECT id, product_name, status FROM products WHERE id = $1`, [id]);
     if (!product) {
-      return res.status(404).json({ success: false, message: 'الصنف غير موجود' });
+      return res.status(404).json({ success: false, message: 'الصنف غير موجود أو تم حذفه مسبقاً' });
     }
 
-    const hasHistory = await checkProductHistory(id);
-
-    if (hasHistory) {
-      // Soft-delete / Archive to preserve financial and inventory records
-      await transaction(async (client) => {
-        await client.query(`UPDATE products SET status = 'archived', updated_at = NOW() WHERE id = $1`, [id]);
-        await client.query(`UPDATE product_variants SET status = 'inactive', updated_at = NOW() WHERE product_id = $1`, [id]);
-      });
-
-      // Invalidate caches
-      try {
-        const keys = await redis.keys('ecp:cache:*');
-        if (keys && keys.length > 0) await redis.del(...keys);
-      } catch (e) {}
-
-      logActivity({
-        userId: req.user.id,
-        userRole: req.user.role,
-        userName: req.user.fullName || req.user.username,
-        actionUrl: '/dashboard/groups_items',
-        branchId: req.user.branchId,
-        actionType: 'ARCHIVE_PRODUCT',
-        entityType: 'products',
-        entityId: id,
-        notes: `Product ${id} (${product.product_name}) archived due to transaction history`
-      });
-
-      return res.json({
-        success: true,
-        action: 'archived',
-        message: `تم أرشفة وتعطيل الصنف "${product.product_name}" بنجاح لحفظ سجلات الحركات المالية والمبيعات`
-      });
-    }
-
-    // Completely safe to delete permanently
+    // Permanently wipe out product and all child records across the system
     await transaction(async (client) => {
-      await client.query(`DELETE FROM inventory_balances WHERE product_id = $1`, [id]);
-      await client.query(`DELETE FROM product_variants WHERE product_id = $1`, [id]);
-      await client.query(`DELETE FROM products WHERE id = $1`, [id]);
+      await cascadeDeleteProduct(client, id);
     });
 
     // Invalidate caches
     try {
       const keys = await redis.keys('ecp:cache:*');
       if (keys && keys.length > 0) await redis.del(...keys);
-    } catch (e) {}
+    } catch (e) { }
 
     logActivity({
       userId: req.user.id,
@@ -1269,13 +1304,13 @@ router.delete('/:id', requireAuth, requireRole(['super_admin', 'admin']), async 
       actionType: 'DELETE_PRODUCT',
       entityType: 'products',
       entityId: id,
-      notes: `Product ${id} (${product.product_name}) permanently deleted`
+      notes: `Product ${id} (${product.product_name}) permanently deleted from all system tables`
     });
 
     return res.json({
       success: true,
       action: 'deleted',
-      message: `تم حذف الصنف "${product.product_name}" نهائياً بنجاح لعدم وجود حركات أو أرصدة سابقة`
+      message: `تم حذف الصنف "${product.product_name}" نهائياً من كافة سجلات وشاشات النظام بنجاح`
     });
   } catch (err) {
     console.error('Delete product error:', err);
@@ -1308,7 +1343,7 @@ router.post('/:id/restore', requireAuth, requireRole(['super_admin', 'admin']), 
     try {
       const keys = await redis.keys('ecp:cache:*');
       if (keys && keys.length > 0) await redis.del(...keys);
-    } catch (e) {}
+    } catch (e) { }
 
     logActivity({
       userId: req.user.id,
@@ -1334,9 +1369,9 @@ router.post('/:id/restore', requireAuth, requireRole(['super_admin', 'admin']), 
 
 /**
  * POST /api/swm/products/bulk-delete
- * Bulk delete or archive selected products safely
+ * Bulk delete products permanently from all system tables (Owner & Main Warehouse)
  */
-router.post('/bulk-delete', requireAuth, requireRole(['super_admin', 'admin']), async (req, res) => {
+router.post('/bulk-delete', requireAuth, requireRole(['super_admin', 'admin', 'warehouse_manager']), async (req, res) => {
   try {
     const { ids } = req.body;
     if (!Array.isArray(ids) || ids.length === 0) {
@@ -1349,21 +1384,11 @@ router.post('/bulk-delete', requireAuth, requireRole(['super_admin', 'admin']), 
     }
 
     let deletedCount = 0;
-    let archivedCount = 0;
 
     await transaction(async (client) => {
       for (const prodId of numericIds) {
-        const hasHistory = await checkProductHistory(prodId, (sql, p) => client.query(sql, p));
-        if (hasHistory) {
-          await client.query(`UPDATE products SET status = 'archived', updated_at = NOW() WHERE id = $1`, [prodId]);
-          await client.query(`UPDATE product_variants SET status = 'inactive', updated_at = NOW() WHERE product_id = $1`, [prodId]);
-          archivedCount++;
-        } else {
-          await client.query(`DELETE FROM inventory_balances WHERE product_id = $1`, [prodId]);
-          await client.query(`DELETE FROM product_variants WHERE product_id = $1`, [prodId]);
-          await client.query(`DELETE FROM products WHERE id = $1`, [prodId]);
-          deletedCount++;
-        }
+        await cascadeDeleteProduct(client, prodId);
+        deletedCount++;
       }
     });
 
@@ -1371,23 +1396,23 @@ router.post('/bulk-delete', requireAuth, requireRole(['super_admin', 'admin']), 
     try {
       const keys = await redis.keys('ecp:cache:*');
       if (keys && keys.length > 0) await redis.del(...keys);
-    } catch (e) {}
+    } catch (e) { }
 
     logActivity({
       userId: req.user.id,
       branchId: req.user.branchId,
       actionType: 'BULK_DELETE_PRODUCTS',
       entityType: 'products',
-      notes: `Bulk processed ${numericIds.length} products: ${deletedCount} deleted, ${archivedCount} archived`
+      notes: `Bulk permanently deleted ${deletedCount} products from all system tables`
     });
 
     return res.json({
       success: true,
-      message: `تمت معالجة حذف ${numericIds.length} صنف: (حذف نهائي: ${deletedCount}، أرشفة وتعطيل: ${archivedCount})`,
-      data: { deletedCount, archivedCount, total: numericIds.length }
+      action: 'deleted',
+      message: `تم حذف (${deletedCount}) صنف نهائياً من كافة سجلات وشاشات النظام بنجاح`
     });
   } catch (err) {
-    console.error('Bulk delete products error:', err);
+    console.error('Bulk delete error:', err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });

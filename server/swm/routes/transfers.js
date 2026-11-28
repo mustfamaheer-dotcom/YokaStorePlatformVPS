@@ -425,84 +425,105 @@ router.post('/', requireAuth, requireRole(['super_admin', 'admin', 'warehouse_ma
     const [{ count }] = await query(`SELECT COUNT(id) AS count FROM stock_transfers`);
     const transferNumber = `DSP-${yymm}-${String(parseInt(count, 10) + 1).padStart(5, '0')}`;
 
-    // Execute atomic transfer transaction
+    // Execute atomic transfer transaction with high-performance batching
     const result = await transaction(async (client) => {
+      // 1. Group & consolidate duplicate items in payload
+      const itemMap = new Map();
+      for (const raw of items) {
+        const pId = parseInt(raw.product_id, 10);
+        if (!pId) continue;
+        const vId = raw.variant_id ? parseInt(raw.variant_id, 10) : null;
+        const qty = parseInt(raw.quantity, 10) || 0;
+        if (qty <= 0) {
+          throw new Error(`كمية غير صالحة للصنف ${raw.product_name || pId}`);
+        }
+        const key = `${pId}_${vId || 'null'}`;
+        if (itemMap.has(key)) {
+          const existing = itemMap.get(key);
+          existing.quantity += qty;
+          if (raw.notes && !existing.notes?.includes(raw.notes)) {
+            existing.notes = existing.notes ? `${existing.notes} | ${raw.notes}` : raw.notes;
+          }
+        } else {
+          itemMap.set(key, {
+            product_id: pId,
+            variant_id: vId,
+            quantity: qty,
+            product_name: raw.product_name,
+            product_code: raw.product_code,
+            notes: raw.notes || null
+          });
+        }
+      }
+
+      const consolidatedItems = Array.from(itemMap.values());
+      if (consolidatedItems.length === 0) {
+        throw new Error('يرجى إضافة أصناف صالحة لإذن الصرف');
+      }
+
+      const productIds = Array.from(new Set(consolidatedItems.map(i => i.product_id)));
+
+      // 2. Batch fetch product info in ONE query
+      const prodPlaceholders = productIds.map((_, i) => `$${i + 1}`).join(', ');
+      const prodRes = await client.query(
+        `SELECT id, product_code, product_name, cost_price FROM products WHERE id IN (${prodPlaceholders})`,
+        productIds
+      );
+      const prodMap = new Map((prodRes.rows || []).map(p => [p.id, p]));
+
+      // 3. Batch lock & fetch available balances in sender branch in ONE query
+      const senderBalPlaceholders = productIds.map((_, i) => `$${i + 2}`).join(', ');
+      const senderBalRes = await client.query(
+        `SELECT * FROM inventory_balances
+         WHERE branch_id = $1 AND product_id IN (${senderBalPlaceholders})
+         FOR UPDATE`,
+        [fromId, ...productIds]
+      );
+      const senderBalRows = senderBalRes.rows || [];
+
+      // Build sender balance index: `${pId}_${vId}` and fallback `${pId}_null`
+      const senderBalMap = new Map();
+      for (const row of senderBalRows) {
+        senderBalMap.set(`${row.product_id}_${row.variant_id || 'null'}`, row);
+      }
+
+      // 4. Validate stock for every item
       let totalUnits = 0;
       const validatedItems = [];
 
-      // 1. Lock and validate stock for each item from sending branch
-      for (const item of items) {
-        const qty = parseInt(item.quantity, 10);
-        if (!qty || qty <= 0) {
-          throw new Error(`كمية غير صالحة للصنف ${item.product_name || item.product_id}`);
+      for (const item of consolidatedItems) {
+        const prod = prodMap.get(item.product_id);
+        const prodName = prod?.product_name || item.product_name || `صنف #${item.product_id}`;
+
+        // Look for variant balance, or fallback to base product balance
+        let balanceRow = senderBalMap.get(`${item.product_id}_${item.variant_id || 'null'}`);
+        if (!balanceRow && item.variant_id) {
+          balanceRow = senderBalMap.get(`${item.product_id}_null`);
         }
-
-        const productId = parseInt(item.product_id, 10);
-        const variantId = item.variant_id ? parseInt(item.variant_id, 10) : null;
-
-        // Query available balance in sender branch with row lock
-        let balanceRow;
-        if (variantId) {
-          const varBalRes = await client.query(
-            `SELECT * FROM inventory_balances
-             WHERE branch_id = $1 AND product_id = $2 AND variant_id = $3
-             FOR UPDATE`,
-            [fromId, productId, variantId]
-          );
-          if (varBalRes.rows.length > 0) {
-            balanceRow = varBalRes.rows[0];
-          } else {
-            // Fallback to base product balance
-            const baseBalRes = await client.query(
-              `SELECT * FROM inventory_balances
-               WHERE branch_id = $1 AND product_id = $2 AND variant_id IS NULL
-               FOR UPDATE`,
-              [fromId, productId]
-            );
-            balanceRow = baseBalRes.rows[0];
-          }
-        } else {
-          const baseBalRes = await client.query(
-            `SELECT * FROM inventory_balances
-             WHERE branch_id = $1 AND product_id = $2 AND variant_id IS NULL
-             FOR UPDATE`,
-            [fromId, productId]
-          );
-          balanceRow = baseBalRes.rows[0];
-        }
-
-        // Fetch fresh product info
-        const prodInfoRes = await client.query(
-          `SELECT id, product_code, product_name, cost_price FROM products WHERE id = $1`,
-          [productId]
-        );
-        const prod = prodInfoRes.rows[0];
-        const prodName = prod?.product_name || item.product_name || `صنف #${productId}`;
 
         const available = balanceRow ? parseInt(balanceRow.available_qty, 10) : 0;
-
-        if (available < qty) {
+        if (available < item.quantity) {
           throw new Error(
-            `الرصيد المتاح للصنف "${prodName}" في ${fromBranch.branch_name} (${available} قطعة) غير كافٍ لصرف (${qty} قطعة)`
+            `الرصيد المتاح للصنف "${prodName}" في ${fromBranch.branch_name} (${available} قطعة) غير كافٍ لصرف (${item.quantity} قطعة)`
           );
         }
 
-        totalUnits += qty;
+        totalUnits += item.quantity;
         validatedItems.push({
-          product_id: productId,
-          variant_id: variantId,
-          quantity: qty,
+          product_id: item.product_id,
+          variant_id: item.variant_id,
+          quantity: item.quantity,
           unit_cost: parseFloat(prod?.cost_price || 0),
           product_name: prod?.product_name || item.product_name,
           product_code: prod?.product_code || item.product_code,
           notes: item.notes || null,
           sender_balance_id: balanceRow.id,
           sender_stock_before: available,
-          sender_stock_after: available - qty
+          sender_stock_after: available - item.quantity
         });
       }
 
-      // 2. Insert into stock_transfers
+      // 5. Insert into stock_transfers header
       const [transfer] = (await client.query(
         `INSERT INTO stock_transfers (
           transfer_number, from_branch_id, to_branch_id, transfer_date,
@@ -524,121 +545,224 @@ router.post('/', requireAuth, requireRole(['super_admin', 'admin', 'warehouse_ma
         ]
       )).rows;
 
-      // 3. Process each item: deduct sender, add receiver, log movements
+      // 6. Multi-row chunked bulk insert into stock_transfer_items (batches of 100)
       const savedItems = [];
-      for (const vItem of validatedItems) {
-        // A. Insert into stock_transfer_items
-        const [savedItem] = (await client.query(
+      const CHUNK_SIZE = 100;
+      for (let i = 0; i < validatedItems.length; i += CHUNK_SIZE) {
+        const chunk = validatedItems.slice(i, i + CHUNK_SIZE);
+        const itemValues = [];
+        const itemParams = [transfer.id];
+        let pIdx = 2;
+        for (const v of chunk) {
+          itemValues.push(`($1, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++}, NOW(), NOW())`);
+          itemParams.push(
+            v.product_id,
+            v.variant_id,
+            v.quantity,
+            v.unit_cost,
+            v.product_name,
+            v.product_code,
+            v.notes
+          );
+        }
+
+        const chunkSaved = (await client.query(
           `INSERT INTO stock_transfer_items (
             transfer_id, product_id, variant_id, quantity, unit_cost,
             product_name, product_code, notes, created_at, updated_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+          ) VALUES ${itemValues.join(', ')}
           RETURNING *`,
-          [
-            transfer.id,
-            vItem.product_id,
-            vItem.variant_id,
-            vItem.quantity,
-            vItem.unit_cost,
-            vItem.product_name,
-            vItem.product_code,
-            vItem.notes
-          ]
-        )).rows;
-        savedItems.push(savedItem);
+          itemParams
+        )).rows || [];
+        savedItems.push(...chunkSaved);
+      }
 
-        // B. Deduct quantity from sender branch inventory_balances
+      // 7. High-performance batch update for sender balances (consolidated by balance ID)
+      const senderBalanceDeductions = new Map();
+      for (const v of validatedItems) {
+        const cur = senderBalanceDeductions.get(v.sender_balance_id) || 0;
+        senderBalanceDeductions.set(v.sender_balance_id, cur + v.quantity);
+      }
+
+      const senderEntries = Array.from(senderBalanceDeductions.entries());
+      for (let i = 0; i < senderEntries.length; i += CHUNK_SIZE) {
+        const batch = senderEntries.slice(i, i + CHUNK_SIZE);
+        const caseClauses = [];
+        const batchParams = [];
+        let bIdx = 1;
+        for (const [balId, qty] of batch) {
+          caseClauses.push(`WHEN $${bIdx++} THEN $${bIdx++}::int`);
+          batchParams.push(balId, qty);
+        }
+        const idPlaceholders = batch.map((_, idx) => `$${idx * 2 + 1}`).join(', ');
         await client.query(
           `UPDATE inventory_balances
-           SET available_qty = available_qty - $1,
+           SET available_qty = available_qty - (CASE id ${caseClauses.join(' ')} END),
                last_movement_at = NOW(),
                last_updated = NOW()
-           WHERE id = $2`,
-          [vItem.quantity, vItem.sender_balance_id]
+           WHERE id IN (${idPlaceholders})`,
+          batchParams
         );
+      }
 
-        // C. Log transfer_out movement for sender
-        await client.query(
-          `INSERT INTO inventory_movements (
-            branch_id, product_id, variant_id, movement_type, quantity_change,
-            quantity_before, quantity_after, reference_type, reference_id,
-            notes, created_by, created_at, updated_at
-          ) VALUES ($1, $2, $3, 'transfer_out', $4, $5, $6, 'stock_transfers', $7, $8, $9, NOW(), NOW())`,
-          [
-            fromId,
-            vItem.product_id,
-            vItem.variant_id,
-            -vItem.quantity,
-            vItem.sender_stock_before,
-            vItem.sender_stock_after,
-            transfer.id,
-            `إذن صرف #${transferNumber} إلى ${toBranch.branch_name}`,
-            req.user.id
-          ]
-        );
+      // 8. Batch lock & fetch receiver branch balances in ONE query
+      const receiverBalPlaceholders = productIds.map((_, i) => `$${i + 2}`).join(', ');
+      const receiverBalRes = await client.query(
+        `SELECT * FROM inventory_balances
+         WHERE branch_id = $1 AND product_id IN (${receiverBalPlaceholders})
+         FOR UPDATE`,
+        [toId, ...productIds]
+      );
+      const receiverBalRows = receiverBalRes.rows || [];
+      const receiverBalMap = new Map();
+      for (const row of receiverBalRows) {
+        receiverBalMap.set(`${row.product_id}_${row.variant_id || 'null'}`, row);
+      }
 
-        // D. Add quantity to receiver branch inventory_balances (UPSERT)
-        let receiverBalRes;
-        if (vItem.variant_id) {
-          receiverBalRes = await client.query(
-            `SELECT * FROM inventory_balances
-             WHERE branch_id = $1 AND product_id = $2 AND variant_id = $3
-             FOR UPDATE`,
-            [toId, vItem.product_id, vItem.variant_id]
-          );
-        } else {
-          receiverBalRes = await client.query(
-            `SELECT * FROM inventory_balances
-             WHERE branch_id = $1 AND product_id = $2 AND variant_id IS NULL
-             FOR UPDATE`,
-            [toId, vItem.product_id]
-          );
+      // 9. Process receiver additions (bulk update existing + bulk insert new)
+      const movementsToInsert = [];
+
+      // Add sender movements (transfer_out)
+      for (const v of validatedItems) {
+        movementsToInsert.push({
+          branch_id: fromId,
+          product_id: v.product_id,
+          variant_id: v.variant_id,
+          movement_type: 'transfer_out',
+          quantity_change: -v.quantity,
+          quantity_before: v.sender_stock_before,
+          quantity_after: v.sender_stock_after,
+          reference_type: 'stock_transfers',
+          reference_id: transfer.id,
+          notes: `إذن صرف #${transferNumber} إلى ${toBranch.branch_name}`,
+          created_by: req.user.id
+        });
+      }
+
+      const existingReceiverAdditions = new Map();
+      const newBalancesToInsert = [];
+
+      for (const v of validatedItems) {
+        let rRow = receiverBalMap.get(`${v.product_id}_${v.variant_id || 'null'}`);
+        if (!rRow && !v.variant_id) {
+          rRow = receiverBalMap.get(`${v.product_id}_null`);
         }
 
         let receiverStockBefore = 0;
-        let receiverStockAfter = vItem.quantity;
+        let receiverStockAfter = v.quantity;
 
-        if (receiverBalRes.rows.length > 0) {
-          const rRow = receiverBalRes.rows[0];
+        if (rRow) {
           receiverStockBefore = parseInt(rRow.available_qty, 10);
-          receiverStockAfter = receiverStockBefore + vItem.quantity;
+          receiverStockAfter = receiverStockBefore + v.quantity;
 
-          await client.query(
-            `UPDATE inventory_balances
-             SET available_qty = available_qty + $1,
-                 last_movement_at = NOW(),
-                 last_updated = NOW()
-             WHERE id = $2`,
-            [vItem.quantity, rRow.id]
-          );
+          const curAdd = existingReceiverAdditions.get(rRow.id) || 0;
+          existingReceiverAdditions.set(rRow.id, curAdd + v.quantity);
+          rRow.available_qty = receiverStockAfter;
         } else {
-          await client.query(
-            `INSERT INTO inventory_balances (
-              branch_id, product_id, variant_id, available_qty,
-              reserved_qty, sold_qty, last_movement_at, last_updated
-            ) VALUES ($1, $2, $3, $4, 0, 0, NOW(), NOW())`,
-            [toId, vItem.product_id, vItem.variant_id, vItem.quantity]
+          // Check if already in pending new balances
+          const pending = newBalancesToInsert.find(
+            (b) => b.product_id === v.product_id && (b.variant_id || null) === (v.variant_id || null)
+          );
+          if (pending) {
+            receiverStockBefore = pending.quantity;
+            receiverStockAfter = pending.quantity + v.quantity;
+            pending.quantity = receiverStockAfter;
+          } else {
+            newBalancesToInsert.push({
+              branch_id: toId,
+              product_id: v.product_id,
+              variant_id: v.variant_id,
+              quantity: v.quantity
+            });
+          }
+        }
+
+        movementsToInsert.push({
+          branch_id: toId,
+          product_id: v.product_id,
+          variant_id: v.variant_id,
+          movement_type: 'transfer_in',
+          quantity_change: v.quantity,
+          quantity_before: receiverStockBefore,
+          quantity_after: receiverStockAfter,
+          reference_type: 'stock_transfers',
+          reference_id: transfer.id,
+          notes: `إذن استلام #${transferNumber} من ${fromBranch.branch_name}`,
+          created_by: req.user.id
+        });
+      }
+
+      // Bulk update existing receiver balances
+      const receiverEntries = Array.from(existingReceiverAdditions.entries());
+      for (let i = 0; i < receiverEntries.length; i += CHUNK_SIZE) {
+        const batch = receiverEntries.slice(i, i + CHUNK_SIZE);
+        const caseClauses = [];
+        const batchParams = [];
+        let bIdx = 1;
+        for (const [balId, qty] of batch) {
+          caseClauses.push(`WHEN $${bIdx++} THEN $${bIdx++}::int`);
+          batchParams.push(balId, qty);
+        }
+        const idPlaceholders = batch.map((_, idx) => `$${idx * 2 + 1}`).join(', ');
+        await client.query(
+          `UPDATE inventory_balances
+           SET available_qty = available_qty + (CASE id ${caseClauses.join(' ')} END),
+               last_movement_at = NOW(),
+               last_updated = NOW()
+           WHERE id IN (${idPlaceholders})`,
+          batchParams
+        );
+      }
+
+      // Bulk insert new receiver balances if any
+      for (let i = 0; i < newBalancesToInsert.length; i += CHUNK_SIZE) {
+        const chunk = newBalancesToInsert.slice(i, i + CHUNK_SIZE);
+        const bValues = [];
+        const bParams = [];
+        let bIdx = 1;
+        for (const b of chunk) {
+          bValues.push(`($${bIdx++}, $${bIdx++}, $${bIdx++}, $${bIdx++}, 0, 0, NOW(), NOW())`);
+          bParams.push(b.branch_id, b.product_id, b.variant_id, b.quantity);
+        }
+        await client.query(
+          `INSERT INTO inventory_balances (
+            branch_id, product_id, variant_id, available_qty,
+            reserved_qty, sold_qty, last_movement_at, last_updated
+          ) VALUES ${bValues.join(', ')}`,
+          bParams
+        );
+      }
+
+      // 10. Multi-row chunked bulk insert for ALL inventory movements (batches of 100)
+      for (let i = 0; i < movementsToInsert.length; i += CHUNK_SIZE) {
+        const chunk = movementsToInsert.slice(i, i + CHUNK_SIZE);
+        const mValues = [];
+        const mParams = [];
+        let mIdx = 1;
+        for (const m of chunk) {
+          mValues.push(`($${mIdx++}, $${mIdx++}, $${mIdx++}, $${mIdx++}, $${mIdx++}, $${mIdx++}, $${mIdx++}, $${mIdx++}, $${mIdx++}, $${mIdx++}, $${mIdx++}, NOW(), NOW())`);
+          mParams.push(
+            m.branch_id,
+            m.product_id,
+            m.variant_id,
+            m.movement_type,
+            m.quantity_change,
+            m.quantity_before,
+            m.quantity_after,
+            m.reference_type,
+            m.reference_id,
+            m.notes,
+            m.created_by
           );
         }
 
-        // E. Log transfer_in movement for receiver
         await client.query(
           `INSERT INTO inventory_movements (
             branch_id, product_id, variant_id, movement_type, quantity_change,
             quantity_before, quantity_after, reference_type, reference_id,
             notes, created_by, created_at, updated_at
-          ) VALUES ($1, $2, $3, 'transfer_in', $4, $5, $6, 'stock_transfers', $7, $8, $9, NOW(), NOW())`,
-          [
-            toId,
-            vItem.product_id,
-            vItem.variant_id,
-            vItem.quantity,
-            receiverStockBefore,
-            receiverStockAfter,
-            transfer.id,
-            `إذن استلام #${transferNumber} من ${fromBranch.branch_name}`,
-            req.user.id
-          ]
+          ) VALUES ${mValues.join(', ')}`,
+          mParams
         );
       }
 

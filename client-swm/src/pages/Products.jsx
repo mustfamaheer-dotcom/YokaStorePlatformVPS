@@ -51,7 +51,7 @@ import BarcodeImage from '../components/BarcodeImage';
 import BarcodePrintModal from '../components/BarcodePrintModal';
 import { generateValidEAN13 } from '../utils/barcode';
 import useDebounce from '../hooks/useDebounce';
-import { canDelete } from '../utils/permissions';
+import { canDelete, canDeleteProduct } from '../utils/permissions';
 
 const { Title, Text } = Typography;
 const { Option } = Select;
@@ -64,6 +64,7 @@ export default function Products({ currentUser, autoOpenCreate, onResetAction })
   const [search, setSearch] = useState('');
   const debouncedSearch = useDebounce(search, 280);
   const [selectedCategory, setSelectedCategory] = useState(undefined);
+  const [pagination, setPagination] = useState({ current: 1, pageSize: 50, total: 0 });
 
   // Review & Inspect Product Modal State
   const [productReviewModalVisible, setProductReviewModalVisible] = useState(false);
@@ -180,16 +181,24 @@ export default function Products({ currentUser, autoOpenCreate, onResetAction })
   };
 
   // Fetch products
-  const fetchProducts = async (currentSearch = debouncedSearch, currentCat = selectedCategory) => {
+  const fetchProducts = async (page = 1, currentSearch = debouncedSearch, currentCat = selectedCategory) => {
     setLoading(true);
     try {
-      const params = { limit: 5000 };
+      const params = {
+        page,
+        limit: pagination.pageSize
+      };
       if (currentSearch) params.search = currentSearch;
       if (currentCat) params.category_id = currentCat;
 
       const res = await api.get('/api/swm/products', { params });
       if (res.data.success) {
         setProducts(res.data.data);
+        setPagination(prev => ({
+          ...prev,
+          current: res.data.meta?.page || 1,
+          total: res.data.meta?.total || 0
+        }));
       }
     } catch (err) {
       message.error(err.response?.data?.message || 'فشل في تحميل قائمة المنتجات');
@@ -253,8 +262,8 @@ export default function Products({ currentUser, autoOpenCreate, onResetAction })
   }, []);
 
   useEffect(() => {
-    fetchProducts(debouncedSearch, selectedCategory);
-  }, [debouncedSearch, selectedCategory]);
+    fetchProducts(1, debouncedSearch, selectedCategory);
+  }, [debouncedSearch, selectedCategory, pagination.pageSize]);
 
   // Inline Quick Add Category
   const handleQuickAddCategory = async () => {
@@ -842,17 +851,17 @@ export default function Products({ currentUser, autoOpenCreate, onResetAction })
             تعديل
           </Button>
 
-          {canDelete(currentUser) && (
+          {(canDelete(currentUser) || canDeleteProduct(currentUser)) && (
             <Popconfirm
-              title="حذف المنتج؟"
-              description="سيتم تحويل حالة المنتج إلى غير نشط (Discontinued)."
+              title="حذف المنتج نهائياً من النظام؟"
+              description="سيتم مسح المنتج وكافة سجلاته نهائياً من النظام."
               onConfirm={() => handleDeleteProduct(record.id)}
-              okText="نعم، احذف"
+              okText="نعم، احذف نهائياً"
               cancelText="إلغاء"
               okButtonProps={{ danger: true }}
             >
               <Button size="small" danger icon={<DeleteOutlined />}>
-                حذف
+                حذف نهائي
               </Button>
             </Popconfirm>
           )}
@@ -934,7 +943,18 @@ export default function Products({ currentUser, autoOpenCreate, onResetAction })
         rowKey="id"
         loading={loading}
         scroll={{ x: 'max-content' }}
-        pagination={false}
+        pagination={{
+          current: pagination.current,
+          pageSize: pagination.pageSize,
+          total: pagination.total,
+          showSizeChanger: true,
+          pageSizeOptions: ['20', '50', '100', '200'],
+          showTotal: (total, range) => `عرض ${range[0]}-${range[1]} من إجمالي ${total} منتج`,
+          onChange: (page, pageSize) => {
+            setPagination(prev => ({ ...prev, current: page, pageSize }));
+            fetchProducts(page, debouncedSearch, selectedCategory);
+          }
+        }}
         bordered
       />
 
