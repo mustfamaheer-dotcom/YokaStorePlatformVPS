@@ -573,9 +573,9 @@ export default function GroupsAndItems({ currentUser: propUser, autoOpenCreate, 
       material: '',
       color: colors[0]?.name || 'أسود',
       size: sizes[0]?.name || 'L',
-      cost_price: 0,
-      selling_price: 0,
-      wholesale_price: 0,
+      cost_price: undefined,
+      selling_price: undefined,
+      wholesale_price: undefined,
       is_ecom_listed: false
     });
     setIsItemModalOpen(true);
@@ -1162,6 +1162,34 @@ export default function GroupsAndItems({ currentUser: propUser, autoOpenCreate, 
           </Tooltip>
         ) : (
           <Tag color="red">غير محدد</Tag>
+        );
+      }
+    },
+    {
+      title: 'سعر البيع للجمهور',
+      dataIndex: 'selling_price',
+      key: 'selling_price',
+      width: 145,
+      render: (val, record) => {
+        const price = parseFloat(val || record.sale_price || 0);
+        const cost = parseFloat(record.cost_price || 0);
+        return (
+          <div>
+            {price > 0 ? (
+              <Tag color="green" style={{ fontSize: 13, fontWeight: 700, padding: '3px 8px' }}>
+                {price.toLocaleString()} ج.م
+              </Tag>
+            ) : (
+              <Tag color="red" style={{ fontSize: 12, fontWeight: 600 }}>
+                0.00 ج.م (غير مسعر)
+              </Tag>
+            )}
+            {cost > 0 && (
+              <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
+                التكلفة: {cost.toLocaleString()} ج.م
+              </div>
+            )}
+          </div>
         );
       }
     },
@@ -1987,7 +2015,63 @@ export default function GroupsAndItems({ currentUser: propUser, autoOpenCreate, 
             </Text>
           </div>
 
-
+          {/* Pricing Section: Selling Price, Cost Price, Wholesale Price */}
+          <div style={{ backgroundColor: '#f0fdf4', border: '1.5px solid #86efac', borderRadius: 8, padding: '14px 16px', marginBottom: 16 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 12 }}>
+              <DollarOutlined style={{ color: '#16a34a', fontSize: 16 }} />
+              <Text strong style={{ color: '#15803d', fontSize: 14 }}>
+                تسعير الصنف (سعر البيع للجمهور وسعر الشراء):
+              </Text>
+            </div>
+            <Row gutter={16}>
+              <Col xs={24} sm={8}>
+                <Form.Item
+                  name="selling_price"
+                  label={<Text strong style={{ color: '#15803d' }}>سعر البيع للجمهور (قطاعي) *</Text>}
+                  rules={[{ required: true, message: 'يرجى إدخال سعر البيع للجمهور' }]}
+                >
+                  <InputNumber
+                    style={{ width: '100%' }}
+                    min={0}
+                    step={5}
+                    placeholder="0.00"
+                    addonAfter="ج.م"
+                    size="large"
+                  />
+                </Form.Item>
+              </Col>
+              <Col xs={24} sm={8}>
+                <Form.Item
+                  name="cost_price"
+                  label="سعر تكلفة الشراء (ج.م)"
+                >
+                  <InputNumber
+                    style={{ width: '100%' }}
+                    min={0}
+                    step={5}
+                    placeholder="0.00"
+                    addonAfter="ج.م"
+                    size="large"
+                  />
+                </Form.Item>
+              </Col>
+              <Col xs={24} sm={8}>
+                <Form.Item
+                  name="wholesale_price"
+                  label="سعر الجملة (ج.م)"
+                >
+                  <InputNumber
+                    style={{ width: '100%' }}
+                    min={0}
+                    step={5}
+                    placeholder="0.00"
+                    addonAfter="ج.م"
+                    size="large"
+                  />
+                </Form.Item>
+              </Col>
+            </Row>
+          </div>
 
           {/* 4. Variant Mode Selection: Single Item vs Multi-variant */}
           <div style={{ marginBottom: 16, backgroundColor: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '12px 14px' }}>
@@ -2609,7 +2693,23 @@ export default function GroupsAndItems({ currentUser: propUser, autoOpenCreate, 
         }
         open={productReviewModalVisible}
         onCancel={() => setProductReviewModalVisible(false)}
-        footer={<Button type="primary" onClick={() => setProductReviewModalVisible(false)}>إغلاق [Esc]</Button>}
+        footer={
+          <Space>
+            <Button
+              type="primary"
+              icon={<EditOutlined />}
+              onClick={() => {
+                const prodToEdit = reviewedProduct;
+                setProductReviewModalVisible(false);
+                handleOpenEditItem(prodToEdit);
+              }}
+              style={{ backgroundColor: '#2563eb' }}
+            >
+              تعديل بيانات وسعر الصنف
+            </Button>
+            <Button onClick={() => setProductReviewModalVisible(false)}>إغلاق [Esc]</Button>
+          </Space>
+        }
         width={700}
         destroyOnHidden
       >
@@ -2651,8 +2751,12 @@ export default function GroupsAndItems({ currentUser: propUser, autoOpenCreate, 
 
                 <Col span={8}>
                   <Text type="secondary" style={{ fontSize: 12 }}>سعر البيع للجمهور:</Text>
-                  <div style={{ fontWeight: 'bold', fontSize: 15, color: '#2563eb', marginTop: 2 }}>
-                    {parseFloat(reviewedProduct.selling_price || 0).toLocaleString()} ج.م
+                  <div style={{ fontWeight: 'bold', fontSize: 15, marginTop: 2 }}>
+                    {parseFloat(reviewedProduct.selling_price || 0) > 0 ? (
+                      <span style={{ color: '#2563eb' }}>{parseFloat(reviewedProduct.selling_price).toLocaleString()} ج.م</span>
+                    ) : (
+                      <Tag color="red" style={{ fontSize: 12, fontWeight: 700 }}>0.00 ج.م (غير مسعر)</Tag>
+                    )}
                   </div>
                 </Col>
 

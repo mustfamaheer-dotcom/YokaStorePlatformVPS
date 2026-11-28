@@ -627,6 +627,7 @@ router.get('/search', requireAuth, requireBranchScope, async (req, res) => {
              p.selling_price,
              p.sale_price,
              p.cost_price,
+             (SELECT pii.selling_price FROM purchase_invoice_items pii WHERE pii.product_id = p.id AND pii.selling_price > 0 ORDER BY pii.id DESC LIMIT 1) AS purchase_selling_price,
              pv.id AS variant_id,
              pv.variant_sku,
              pv.barcode AS variant_barcode,
@@ -651,7 +652,19 @@ router.get('/search', requireAuth, requireBranchScope, async (req, res) => {
     const results = await query(sql, params);
 
     const formatted = results.map(row => {
-      const basePrice = parseFloat(row.sale_price || row.selling_price) || 0;
+      const rawSale = parseFloat(row.sale_price);
+      const rawSelling = parseFloat(row.selling_price);
+      const rawPurchase = parseFloat(row.purchase_selling_price);
+
+      let basePrice = 0;
+      if (!isNaN(rawSale) && rawSale > 0) {
+        basePrice = rawSale;
+      } else if (!isNaN(rawSelling) && rawSelling > 0) {
+        basePrice = rawSelling;
+      } else if (!isNaN(rawPurchase) && rawPurchase > 0) {
+        basePrice = rawPurchase;
+      }
+
       const modifier = parseFloat(row.price_modifier || 0);
       const finalPrice = Math.max(0, basePrice + modifier);
 
@@ -670,6 +683,7 @@ router.get('/search', requireAuth, requireBranchScope, async (req, res) => {
           ? `${row.product_name} (${[row.color, row.size].filter(Boolean).join(' / ')})`
           : row.product_name,
         unit_price: finalPrice,
+        selling_price: (!isNaN(rawSelling) && rawSelling > 0) ? rawSelling : ((!isNaN(rawPurchase) && rawPurchase > 0) ? rawPurchase : 0),
         cost_price: parseFloat(row.cost_price) || 0,
         available_qty: parseInt(row.available_qty, 10)
       };

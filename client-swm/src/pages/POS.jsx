@@ -712,6 +712,20 @@ export default function POS({ currentUser }) {
     );
   };
 
+  // Set item unit price directly (e.g. for unpriced items)
+  const setCartPriceDirect = (key, priceVal) => {
+    const val = parseFloat(priceVal);
+    if (isNaN(val) || val < 0) return;
+
+    setCart((prev) =>
+      prev.map((item) => {
+        if (item.key !== key) return item;
+        const lineTotal = item.quantity * val;
+        return { ...item, unit_price: val, line_total: lineTotal };
+      })
+    );
+  };
+
   // When Enter is pressed in Quantity InputNumber
   const handleQuantityPressEnter = (e, rowKey) => {
     e?.preventDefault?.();
@@ -887,6 +901,12 @@ export default function POS({ currentUser }) {
   const handleStep3CompleteSale = async () => {
     if (validItems.length === 0) {
       return message.error('الفاتورة لا تحتوي على أصناف صالحة. اضغط F11 ثم F1 لإضافة أصناف.');
+    }
+
+    // Zero-Price Item Validation
+    const zeroPriceItem = validItems.find((i) => !i.unit_price || parseFloat(i.unit_price) <= 0);
+    if (zeroPriceItem && invoiceType === 'sale') {
+      return message.error(`الصنف "${zeroPriceItem.product_name}" ليس له سعر بيع للجمهور (0.00 ج.م)! يرجى تحديد السعر أولاً.`);
     }
 
     // Dynamic Client Data Validation
@@ -1277,7 +1297,7 @@ export default function POS({ currentUser }) {
                     <th style={{ padding: '10px 10px' }}>اسم الصنف والمواصفات</th>
                     <th style={{ padding: '10px 10px', width: 95, textAlign: 'center' }}>المخزون</th>
                     <th style={{ padding: '10px 10px', width: 130, textAlign: 'center' }}>الكمية</th>
-                    <th style={{ padding: '10px 10px', width: 105, textAlign: 'center' }}>السعر</th>
+                    <th style={{ padding: '10px 10px', width: 115, textAlign: 'center' }}>سعر الجمهور</th>
                     <th style={{ padding: '10px 10px', width: 115, textAlign: 'center' }}>الإجمالي</th>
                     <th style={{ padding: '10px 6px', width: 44, textAlign: 'center' }}></th>
                   </tr>
@@ -1372,7 +1392,21 @@ export default function POS({ currentUser }) {
                           </Space>
                         </td>
                         <td style={{ padding: '8px 10px', textAlign: 'center', fontWeight: 600, color: '#334155' }}>
-                          {item.unit_price.toFixed(2)}
+                          {item.unit_price > 0 ? (
+                            <span>{item.unit_price.toFixed(2)}</span>
+                          ) : (
+                            <Tooltip title="الصنف غير مسعر - يرجى كتابة سعر البيع للجمهور هنا">
+                              <InputNumber
+                                min={0}
+                                step={5}
+                                placeholder="0.00"
+                                value={item.unit_price || ''}
+                                onChange={(val) => setCartPriceDirect(item.key, val)}
+                                status="error"
+                                style={{ width: 85, fontWeight: 700 }}
+                              />
+                            </Tooltip>
+                          )}
                         </td>
                         <td
                           style={{
@@ -1770,11 +1804,15 @@ export default function POS({ currentUser }) {
                     )
                   },
                   {
-                    title: 'السعر',
+                    title: 'سعر البيع للجمهور',
                     dataIndex: 'unit_price',
                     key: 'unit_price',
-                    width: 110,
-                    render: (p) => <Text strong style={{ color: '#16a34a', fontSize: 14 }}>{p.toFixed(2)} ج.م</Text>
+                    width: 135,
+                    render: (p) => (
+                      <Text strong style={{ color: p > 0 ? '#16a34a' : '#dc2626', fontSize: 13 }}>
+                        {p > 0 ? `${p.toFixed(2)} ج.م` : '0.00 ج.م (غير مسعر)'}
+                      </Text>
+                    )
                   },
                   {
                     title: 'المخزون',
